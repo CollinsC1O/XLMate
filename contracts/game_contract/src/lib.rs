@@ -1,5 +1,9 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, symbol_short, Address, Env, Symbol, Vec, Map};
+use soroban_sdk::token::TokenClient;
+use soroban_sdk::{
+    Address, Env, Map, Symbol, Vec, contract, contracterror, contractimpl, contracttype,
+    symbol_short,
+};
 
 // Game states
 #[contracttype]
@@ -40,6 +44,7 @@ pub struct ChessMove {
 const GAME_COUNTER: Symbol = symbol_short!("GAME_CNT");
 const GAMES: Symbol = symbol_short!("GAMES");
 const ESCROW: Symbol = symbol_short!("ESCROW");
+const TOKEN_CONTRACT: Symbol = symbol_short!("TOKEN");
 
 // Contract errors
 #[contracterror]
@@ -63,10 +68,39 @@ pub struct GameContract;
 
 #[contractimpl]
 impl GameContract {
-    // Create a new game with XLM escrow
+    pub fn initialize(env: Env, token_contract: Address) {
+        if env.storage().instance().has(&TOKEN_CONTRACT) {
+            panic!("Contract already initialized");
+        }
+        token_contract.require_auth();
+        env.storage()
+            .instance()
+            .set(&TOKEN_CONTRACT, &token_contract);
+    }
+
+    fn token_contract_address(env: &Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&TOKEN_CONTRACT)
+            .expect("Token contract is not initialized")
+    }
+
+    fn token_client(env: &Env) -> TokenClient {
+        TokenClient::new(env, &Self::token_contract_address(env))
+    }
+
+    // Create a new game with token-based escrow
     pub fn create_game(env: Env, player1: Address, wager_amount: i128) -> u64 {
-        // TODO: Add proper balance check
-        // For now, we'll skip the balance check to get compilation working
+        player1.require_auth();
+
+        let token_client = Self::token_client(&env);
+        let contract_address = env.current_contract_address();
+        let player_balance = token_client.balance(&player1);
+        if player_balance < wager_amount {
+            panic!("Insufficient funds");
+        }
+
+        token_client.transfer(&player1, &contract_address, &wager_amount);
 
         // Generate unique game ID
         let mut game_counter: u64 = env.storage().instance().get(&GAME_COUNTER).unwrap_or(0);
@@ -87,12 +121,20 @@ impl GameContract {
         };
 
         // Store game
-        let mut games: Map<u64, Game> = env.storage().instance().get(&GAMES).unwrap_or(Map::new(&env));
+        let mut games: Map<u64, Game> = env
+            .storage()
+            .instance()
+            .get(&GAMES)
+            .unwrap_or(Map::new(&env));
         games.set(game_counter, game);
         env.storage().instance().set(&GAMES, &games);
 
         // Add to escrow
-        let mut escrow: Map<Address, i128> = env.storage().instance().get(&ESCROW).unwrap_or(Map::new(&env));
+        let mut escrow: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&ESCROW)
+            .unwrap_or(Map::new(&env));
         let current_escrow = escrow.get(player1.clone()).unwrap_or(0);
         escrow.set(player1, current_escrow + wager_amount);
         env.storage().instance().set(&ESCROW, &escrow);
@@ -102,9 +144,12 @@ impl GameContract {
 
     // Join an existing game
     pub fn join_game(env: Env, game_id: u64, player2: Address) -> Result<(), ContractError> {
-        let mut games: Map<u64, Game> = env.storage().instance().get(&GAMES)
+        let mut games: Map<u64, Game> = env
+            .storage()
+            .instance()
+            .get(&GAMES)
             .ok_or(ContractError::GameNotFound)?;
-        
+
         let mut game = games.get(game_id).ok_or(ContractError::GameNotFound)?;
 
         // Validate game state
@@ -120,9 +165,15 @@ impl GameContract {
             return Err(ContractError::AlreadyJoined);
         }
 
-        // Verify player has sufficient funds
-        // TODO: Add proper balance check
-        // For now, we'll skip the balance check to get compilation working
+        player2.require_auth();
+        let token_client = Self::token_client(&env);
+        let contract_address = env.current_contract_address();
+        let player2_balance = token_client.balance(&player2);
+        if player2_balance < game.wager_amount {
+            return Err(ContractError::InsufficientFunds);
+        }
+
+        token_client.transfer(&player2, &contract_address, &game.wager_amount);
 
         // Update game
         game.player2 = Some(player2.clone());
@@ -130,7 +181,11 @@ impl GameContract {
         game.current_turn = 1;
 
         // Update escrow
-        let mut escrow: Map<Address, i128> = env.storage().instance().get(&ESCROW).unwrap_or(Map::new(&env));
+        let mut escrow: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&ESCROW)
+            .unwrap_or(Map::new(&env));
         let current_escrow = escrow.get(player2.clone()).unwrap_or(0);
         escrow.set(player2, current_escrow + game.wager_amount);
         env.storage().instance().set(&ESCROW, &escrow);
@@ -143,10 +198,18 @@ impl GameContract {
     }
 
     // Submit a chess move
-    pub fn submit_move(env: Env, game_id: u64, player: Address, move_data: Vec<u32>) -> Result<(), ContractError> {
-        let mut games: Map<u64, Game> = env.storage().instance().get(&GAMES)
+    pub fn submit_move(
+        env: Env,
+        game_id: u64,
+        player: Address,
+        move_data: Vec<u32>,
+    ) -> Result<(), ContractError> {
+        let mut games: Map<u64, Game> = env
+            .storage()
+            .instance()
+            .get(&GAMES)
             .ok_or(ContractError::GameNotFound)?;
-        
+
         let mut game = games.get(game_id).ok_or(ContractError::GameNotFound)?;
 
         // Validate game state
@@ -155,7 +218,11 @@ impl GameContract {
         }
 
         // Validate turn
-        let player_num = if player == game.player1 { 1 } else if Some(player.clone()) == game.player2 { 2 } else {
+        let player_num = if player == game.player1 {
+            1
+        } else if Some(player.clone()) == game.player2 {
+            2
+        } else {
             return Err(ContractError::NotPlayer);
         };
 
@@ -189,9 +256,12 @@ impl GameContract {
 
     // Claim a draw
     pub fn claim_draw(env: Env, game_id: u64, player: Address) -> Result<(), ContractError> {
-        let mut games: Map<u64, Game> = env.storage().instance().get(&GAMES)
+        let mut games: Map<u64, Game> = env
+            .storage()
+            .instance()
+            .get(&GAMES)
             .ok_or(ContractError::GameNotFound)?;
-        
+
         let mut game = games.get(game_id).ok_or(ContractError::GameNotFound)?;
 
         // Validate game state
@@ -219,9 +289,12 @@ impl GameContract {
 
     // Forfeit the game
     pub fn forfeit(env: Env, game_id: u64, player: Address) -> Result<(), ContractError> {
-        let mut games: Map<u64, Game> = env.storage().instance().get(&GAMES)
+        let mut games: Map<u64, Game> = env
+            .storage()
+            .instance()
+            .get(&GAMES)
             .ok_or(ContractError::GameNotFound)?;
-        
+
         let mut game = games.get(game_id).ok_or(ContractError::GameNotFound)?;
 
         // Validate game state
@@ -236,7 +309,10 @@ impl GameContract {
 
         // Determine winner (the other player)
         let winner = if player == game.player1 {
-            game.player2.as_ref().ok_or(ContractError::GameFull)?.clone()
+            game.player2
+                .as_ref()
+                .ok_or(ContractError::GameFull)?
+                .clone()
         } else {
             game.player1.clone()
         };
@@ -257,9 +333,12 @@ impl GameContract {
 
     // Payout winnings to the winner
     pub fn payout(env: Env, game_id: u64, winner: Address) -> Result<(), ContractError> {
-        let mut games: Map<u64, Game> = env.storage().instance().get(&GAMES)
+        let mut games: Map<u64, Game> = env
+            .storage()
+            .instance()
+            .get(&GAMES)
             .ok_or(ContractError::GameNotFound)?;
-        
+
         let game = games.get(game_id).ok_or(ContractError::GameNotFound)?;
 
         // Validate game state
@@ -284,26 +363,40 @@ impl GameContract {
 
     // Get game details
     pub fn get_game(env: Env, game_id: u64) -> Result<Game, ContractError> {
-        let games: Map<u64, Game> = env.storage().instance().get(&GAMES)
+        let games: Map<u64, Game> = env
+            .storage()
+            .instance()
+            .get(&GAMES)
             .ok_or(ContractError::GameNotFound)?;
-        
+
         games.get(game_id).ok_or(ContractError::GameNotFound)
     }
 
     // Get all games
     pub fn get_all_games(env: Env) -> Map<u64, Game> {
-        env.storage().instance().get(&GAMES).unwrap_or(Map::new(&env))
+        env.storage()
+            .instance()
+            .get(&GAMES)
+            .unwrap_or(Map::new(&env))
     }
 
     // Helper function to process draw payout
     fn process_draw_payout(env: &Env, game: &Game) -> Result<(), ContractError> {
-        let mut escrow: Map<Address, i128> = env.storage().instance().get(&ESCROW).unwrap_or(Map::new(env));
-        
-        // Return wagers to both players
+        let token_client = Self::token_client(env);
+        let contract_address = env.current_contract_address();
+
+        token_client.transfer(&contract_address, &game.player1, &game.wager_amount);
+
+        let mut escrow: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&ESCROW)
+            .unwrap_or(Map::new(env));
         let player1_escrow = escrow.get(game.player1.clone()).unwrap_or(0);
         escrow.set(game.player1.clone(), player1_escrow - game.wager_amount);
-        
+
         if let Some(ref player2) = game.player2 {
+            token_client.transfer(&contract_address, player2, &game.wager_amount);
             let player2_escrow = escrow.get(player2.clone()).unwrap_or(0);
             escrow.set(player2.clone(), player2_escrow - game.wager_amount);
         }
@@ -313,20 +406,29 @@ impl GameContract {
     }
 
     // Helper function to process forfeit payout
-    fn process_forfeit_payout(env: &Env, game: &Game, winner: &Address) -> Result<(), ContractError> {
-        let mut escrow: Map<Address, i128> = env.storage().instance().get(&ESCROW).unwrap_or(Map::new(env));
-        
-        // Transfer both wagers to winner
+    fn process_forfeit_payout(
+        env: &Env,
+        game: &Game,
+        winner: &Address,
+    ) -> Result<(), ContractError> {
+        let token_client = Self::token_client(env);
+        let contract_address = env.current_contract_address();
+        token_client.transfer(&contract_address, winner, &(game.wager_amount * 2));
+
+        let mut escrow: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&ESCROW)
+            .unwrap_or(Map::new(env));
         let winner_escrow = escrow.get(winner.clone()).unwrap_or(0);
         escrow.set(winner.clone(), winner_escrow + (game.wager_amount * 2));
-        
-        // Remove from loser's escrow
+
         let loser = if winner == &game.player1 {
             game.player2.as_ref().ok_or(ContractError::GameFull)?
         } else {
             &game.player1
         };
-        
+
         let loser_escrow = escrow.get(loser.clone()).unwrap_or(0);
         escrow.set(loser.clone(), loser_escrow - game.wager_amount);
 
@@ -336,19 +438,24 @@ impl GameContract {
 
     // Helper function to process win payout
     fn process_win_payout(env: &Env, game: &Game, winner: &Address) -> Result<(), ContractError> {
-        let mut escrow: Map<Address, i128> = env.storage().instance().get(&ESCROW).unwrap_or(Map::new(env));
-        
-        // Transfer both wagers to winner
+        let token_client = Self::token_client(env);
+        let contract_address = env.current_contract_address();
+        token_client.transfer(&contract_address, winner, &(game.wager_amount * 2));
+
+        let mut escrow: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&ESCROW)
+            .unwrap_or(Map::new(env));
         let winner_escrow = escrow.get(winner.clone()).unwrap_or(0);
         escrow.set(winner.clone(), winner_escrow + (game.wager_amount * 2));
-        
-        // Remove from loser's escrow
+
         let loser = if winner == &game.player1 {
             game.player2.as_ref().ok_or(ContractError::GameFull)?
         } else {
             &game.player1
         };
-        
+
         let loser_escrow = escrow.get(loser.clone()).unwrap_or(0);
         escrow.set(loser.clone(), loser_escrow - game.wager_amount);
 
@@ -357,3 +464,48 @@ impl GameContract {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token::{StellarAssetClient, TokenClient};
+    use soroban_sdk::{Address, Env};
+
+    #[test]
+    fn test_usdc_staking_workflow() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let issuer = Address::generate(&env);
+        let player1 = Address::generate(&env);
+        let player2 = Address::generate(&env);
+
+        let stellar_token = env.register_stellar_asset_contract_v2(issuer.clone());
+        let token_address = stellar_token.address();
+        let token_client = TokenClient::new(&env, &token_address);
+        let stellar_asset_client = StellarAssetClient::new(&env, &token_address);
+
+        // Mint both player balances
+        let fund_amount: i128 = 1_000;
+        stellar_asset_client.mint(&player1, &fund_amount);
+        stellar_asset_client.mint(&player2, &fund_amount);
+
+        // Deploy game contract and initialize with token contract
+        let contract_id = env.register_contract(None, GameContract);
+        let client = GameContractClient::new(&env, &contract_id);
+        client.initialize(&token_address);
+
+        // Player 1 creates game with USDC staking
+        let initial_wager: i128 = 100;
+        let game_id = client.create_game(&player1, &initial_wager);
+
+        // Player 2 joins game
+        client.join_game(&game_id, &player2);
+
+        // Player 1 forfeits, winner is player 2; contract should pay out 200
+        client.forfeit(&game_id, &player1);
+
+        let final_player2_balance = token_client.balance(&player2);
+        assert_eq!(final_player2_balance, 1_100);
+    }
+}
