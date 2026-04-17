@@ -118,6 +118,13 @@ This starts PostgreSQL, backend, frontend, and (optionally) a local Soroban quic
 - **Futurenet** — For advanced Soroban testing
 - **Mainnet** — Production (use real XLM)
 
+## 🏁 Contributor Roadmap (SCF Grant Readiness)
+We have identified **150 independent tasks** across the frontend, backend, contracts, and AI engine to make XLMate a premier platform for the Stellar ecosystem.
+
+- [View the Grant Readiness Task List](./docs/scf_grant_readiness_issues.md)
+- **Contributors**: Please pick any open issue labeled `contribution-ready`.
+- **Status**: Preparing for Stellar Community Fund (SCF) submission.
+
 ## Helpful Links
 - Stellar Developer Docs: https://developers.stellar.org/
 - Soroban Docs & Tutorials: https://soroban.stellar.org/docs
@@ -132,8 +139,8 @@ We welcome PRs! Please:
 3. Add tests for new logic.
 4. Target the `main` branch.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md)  for details.
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for details on how to get started with the  issues.
 
 Built with ❤️ on Stellar — fast, affordable, and ready for real-world gaming.
 
-Questions? Open an issue or reach out!
+Questions? reach out!
