@@ -55,11 +55,11 @@ pub enum DisputeStatus {
 pub struct Dispute {
     pub id: u64,
     pub game_id: u64,
-    pub filer: Address,      // Player who filed the dispute
-    pub against: Address,    // Opponent
-    pub reason: Bytes,       // Dispute reason (encoded)
+    pub filer: Address,   // Player who filed the dispute
+    pub against: Address, // Opponent
+    pub reason: Bytes,    // Dispute reason (encoded)
     pub status: DisputeStatus,
-    pub filed_at: u64,       // Ledger sequence
+    pub filed_at: u64,             // Ledger sequence
     pub resolution: Option<Bytes>, // Arbitrator's resolution
 }
 
@@ -67,13 +67,13 @@ pub struct Dispute {
 #[derive(Clone, Debug)]
 pub struct PlayerRating {
     pub address: Address,
-    pub rating: i32,          // Current ELO rating
+    pub rating: i32, // Current ELO rating
     pub games_played: u32,
     pub wins: u32,
     pub losses: u32,
     pub draws: u32,
     pub highest_rating: i32,
-    pub last_updated: u64,    // Ledger sequence
+    pub last_updated: u64, // Ledger sequence
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -97,6 +97,8 @@ const MAX_STAKE: Symbol = symbol_short!("MAXSTAKE");
 const FEE_BIPS: Symbol = symbol_short!("FEE_BIPS"); // u32  (0–1000, i.e. 0–10 %)
 const TREASURY_ADDR: Symbol = symbol_short!("TR_ADDR"); // Address
 const CONTRACT_ADMIN: Symbol = symbol_short!("CT_ADMIN"); // Address
+const FEE_ADMINS: Symbol = symbol_short!("FEE_ADMS"); // Vec<Address>
+const FEE_THRESHOLD: Symbol = symbol_short!("FEE_THR"); // u32
 
 // Dispute resolution system
 const DISPUTE_FEE: Symbol = symbol_short!("D_FEE"); // i128 - fee to file a dispute
@@ -664,7 +666,12 @@ impl GameContract {
         env.storage().instance().set(&MAX_STAKE, &new_limit);
     }
 
-    pub fn configure_fees(env: Env, admin: Address, fee_bips: u32, treasury_address: Address) {
+    pub fn configure_fee_multisig(
+        env: Env,
+        caller: Address,
+        new_admins: Vec<Address>,
+        threshold: u32,
+    ) {
         let current_admin: Address = env
             .storage()
             .instance()
@@ -672,9 +679,73 @@ impl GameContract {
             .expect("Not initialized");
         current_admin.require_auth();
 
-        if admin != current_admin {
+        if caller != current_admin {
             panic!("Unauthorized admin address");
         }
+        if threshold == 0 || threshold > new_admins.len() as u32 {
+            panic!("Invalid threshold");
+        }
+
+        let mut unique_set = Vec::new(&env);
+        for i in 0..new_admins.len() {
+            let admin = new_admins.get(i).unwrap();
+            if unique_set.contains(&admin) {
+                panic!("Duplicate admins in list");
+            }
+            unique_set.push_back(admin);
+        }
+
+        env.storage().instance().set(&FEE_ADMINS, &new_admins);
+        env.storage().instance().set(&FEE_THRESHOLD, &threshold);
+    }
+
+    pub fn configure_fees(
+        env: Env,
+        admins: Vec<Address>,
+        fee_bips: u32,
+        treasury_address: Address,
+    ) {
+        let stored_admins: Vec<Address> =
+            env.storage()
+                .instance()
+                .get(&FEE_ADMINS)
+                .unwrap_or_else(|| {
+                    let current_admin: Address = env
+                        .storage()
+                        .instance()
+                        .get(&CONTRACT_ADMIN)
+                        .expect("Not initialized");
+                    let mut v = Vec::new(&env);
+                    v.push_back(current_admin);
+                    v
+                });
+        let threshold: u32 = env.storage().instance().get(&FEE_THRESHOLD).unwrap_or(1);
+
+        if admins.len() < threshold {
+            panic!("Not enough admin approvals");
+        }
+
+        let mut unique_approvals = 0;
+        let mut approved_set = Vec::new(&env);
+
+        for i in 0..admins.len() {
+            let admin = admins.get(i).unwrap();
+            if stored_admins.contains(&admin) {
+                if approved_set.contains(&admin) {
+                    panic!("Duplicate admin approvals");
+                }
+                admin.require_auth();
+                approved_set.push_back(admin.clone());
+                unique_approvals += 1;
+            } else {
+                panic!("Unauthorized admin address");
+            }
+        }
+
+        if unique_approvals < threshold {
+            panic!("Not enough valid admin approvals");
+        }
+
         if fee_bips > 1000 {
             panic!("Fee bips must be between 0 and 1000");
         }
@@ -814,7 +885,12 @@ impl GameContract {
     /// Configure dispute resolution system
     /// * `arbitrator` - Address of the dispute arbitrator
     /// * `dispute_fee` - Fee required to file a dispute (in tokens)
-    pub fn configure_dispute_system(env: Env, admin: Address, arbitrator: Address, dispute_fee: i128) {
+    pub fn configure_dispute_system(
+        env: Env,
+        admin: Address,
+        arbitrator: Address,
+        dispute_fee: i128,
+    ) {
         let current_admin: Address = env
             .storage()
             .instance()
@@ -884,7 +960,9 @@ impl GameContract {
         // Create dispute
         let mut dispute_counter: u64 = env.storage().instance().get(&DISPUTE_COUNTER).unwrap_or(0);
         dispute_counter += 1;
-        env.storage().instance().set(&DISPUTE_COUNTER, &dispute_counter);
+        env.storage()
+            .instance()
+            .set(&DISPUTE_COUNTER, &dispute_counter);
 
         let dispute = Dispute {
             id: dispute_counter,
@@ -980,9 +1058,7 @@ impl GameContract {
                 .get(&GAMES)
                 .ok_or(ContractError::GameNotFound)?;
 
-            let mut game = games
-                .get(game_id)
-                .ok_or(ContractError::GameNotFound)?;
+            let mut game = games.get(game_id).ok_or(ContractError::GameNotFound)?;
 
             game.state = GameState::Completed;
             game.winner = Some(winner_addr.clone());
@@ -998,9 +1074,7 @@ impl GameContract {
                 .get(&GAMES)
                 .ok_or(ContractError::GameNotFound)?;
 
-            let game = games
-                .get(game_id)
-                .ok_or(ContractError::GameNotFound)?;
+            let game = games.get(game_id).ok_or(ContractError::GameNotFound)?;
 
             Self::process_draw_payout(&env, &game)?;
 
@@ -1388,7 +1462,13 @@ mod tests {
         let client = GameContractClient::new(&env, &contract_id);
 
         client.initialize_token(&admin, &token_address);
-        client.initialize_puzzle_rewards(&admin, &Bytes::from_slice(&env, &[0u8; 32]), &0i128, &0u32, &treasury_addr);
+        client.initialize_puzzle_rewards(
+            &admin,
+            &Bytes::from_slice(&env, &[0u8; 32]),
+            &0i128,
+            &0u32,
+            &treasury_addr,
+        );
         client.configure_dispute_system(&admin, &arbitrator, &50i128);
         client.set_max_stake(&1_000i128);
 
@@ -1434,7 +1514,13 @@ mod tests {
         let client = GameContractClient::new(&env, &contract_id);
 
         client.initialize_token(&admin, &token_address);
-        client.initialize_puzzle_rewards(&admin, &Bytes::from_slice(&env, &[0u8; 32]), &0i128, &0u32, &treasury_addr);
+        client.initialize_puzzle_rewards(
+            &admin,
+            &Bytes::from_slice(&env, &[0u8; 32]),
+            &0i128,
+            &0u32,
+            &treasury_addr,
+        );
         client.configure_dispute_system(&admin, &arbitrator, &50i128);
         client.set_max_stake(&1_000i128);
 
@@ -1448,7 +1534,12 @@ mod tests {
 
         // Arbitrator resolves in favor of player1
         let resolution = Bytes::from_slice(&env, b"Player1 wins");
-        client.resolve_dispute(&dispute_id, &arbitrator, &Some(player1.clone()), &resolution);
+        client.resolve_dispute(
+            &dispute_id,
+            &arbitrator,
+            &Some(player1.clone()),
+            &resolution,
+        );
 
         // Verify player1 received the payout
         assert_eq!(token_client.balance(&player1), 1_050);
@@ -1482,7 +1573,13 @@ mod tests {
         let client = GameContractClient::new(&env, &contract_id);
 
         client.initialize_token(&admin, &token_address);
-        client.initialize_puzzle_rewards(&admin, &Bytes::from_slice(&env, &[0u8; 32]), &0i128, &0u32, &treasury_addr);
+        client.initialize_puzzle_rewards(
+            &admin,
+            &Bytes::from_slice(&env, &[0u8; 32]),
+            &0i128,
+            &0u32,
+            &treasury_addr,
+        );
         client.configure_dispute_system(&admin, &arbitrator, &50i128);
         client.set_max_stake(&1_000i128);
 
