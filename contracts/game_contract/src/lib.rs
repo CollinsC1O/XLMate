@@ -41,6 +41,19 @@ pub struct ChessMove {
     pub timestamp: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PlayerRating {
+    pub address: Address,
+    pub rating: i32,          // Current ELO rating
+    pub games_played: u32,
+    pub wins: u32,
+    pub losses: u32,
+    pub draws: u32,
+    pub highest_rating: i32,
+    pub last_updated: u64,    // Ledger sequence
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Storage keys
 // ────────────────────────────────────────────────────────────────────────────
@@ -62,6 +75,10 @@ const MAX_STAKE: Symbol = symbol_short!("MAXSTAKE");
 const FEE_BIPS: Symbol = symbol_short!("FEE_BIPS"); // u32  (0–1000, i.e. 0–10 %)
 const TREASURY_ADDR: Symbol = symbol_short!("TR_ADDR"); // Address
 const CONTRACT_ADMIN: Symbol = symbol_short!("CT_ADMIN"); // Address
+
+// ELO Rating System
+const PLAYER_RATINGS: Symbol = symbol_short!("RATING"); // Map<Address, PlayerRating>
+const K_FACTOR: Symbol = symbol_short!("K_FACT"); // u32 - ELO K-factor for rating calculations
 
 // ────────────────────────────────────────────────────────────────────────────
 // Errors
@@ -86,6 +103,8 @@ pub enum ContractError {
     /// Invalid or already-used backend signature  (#199)
     Unauthorized = 14,
     StakeLimitExceeded = 15,
+    /// Player has no rating yet
+    RatingNotFound = 16,
 }
 
 #[contract]
@@ -748,6 +767,194 @@ impl GameContract {
     pub fn treasury_balance(env: Env) -> i128 {
         env.storage().instance().get(&TREASURY).unwrap_or(0)
     }
+
+    // ── ELO Rating System ──────────────────────────────────────────────────
+
+    /// Initialize ELO rating system with default K-factor of 32
+    pub fn initialize_elo_system(env: Env, admin: Address, k_factor: u32) {
+        let current_admin: Address = env
+            .storage()
+            .instance()
+            .get(&CONTRACT_ADMIN)
+            .expect("Not initialized");
+        current_admin.require_auth();
+
+        if admin != current_admin {
+            panic!("Unauthorized admin address");
+        }
+        if k_factor == 0 || k_factor > 100 {
+            panic!("K-factor must be between 1 and 100");
+        }
+
+        env.storage().instance().set(&K_FACTOR, &k_factor);
+    }
+
+    /// Register a new player with default rating (1200)
+    /// Or return existing player rating
+    pub fn register_player(env: Env, player: Address) -> PlayerRating {
+        player.require_auth();
+
+        let mut ratings: Map<Address, PlayerRating> = env
+            .storage()
+            .instance()
+            .get(&PLAYER_RATINGS)
+            .unwrap_or(Map::new(&env));
+
+        // Check if player already exists
+        if let Some(rating) = ratings.get(player.clone()) {
+            return rating;
+        }
+
+        // Create new player with default rating
+        let new_rating = PlayerRating {
+            address: player.clone(),
+            rating: 1200,
+            games_played: 0,
+            wins: 0,
+            losses: 0,
+            draws: 0,
+            highest_rating: 1200,
+            last_updated: env.ledger().sequence() as u64,
+        };
+
+        ratings.set(player.clone(), new_rating.clone());
+        env.storage().instance().set(&PLAYER_RATINGS, &ratings);
+
+        // Emit registration event
+        env.events().publish(
+            (symbol_short!("elo"), symbol_short!("reg")),
+            (player, 1200i32),
+        );
+
+        new_rating
+    }
+
+    /// Update player ratings after a game
+    /// This should be called internally when a game completes
+    /// Uses standard ELO formula:
+    ///   R' = R + K * (S - E)
+    /// where:
+    ///   R' = new rating
+    ///   R  = current rating
+    ///   K  = K-factor
+    ///   S  = actual score (1=win, 0.5=draw, 0=loss)
+    ///   E  = expected score = 1 / (1 + 10^((Rb-Ra)/400))
+    pub fn update_ratings(
+        env: Env,
+        player1: Address,
+        player2: Address,
+        result: u32, // 1 = player1 wins, 2 = player2 wins, 3 = draw
+    ) -> Result<(PlayerRating, PlayerRating), ContractError> {
+        if result < 1 || result > 3 {
+            return Err(ContractError::InvalidMove);
+        }
+
+        let k_factor: u32 = env
+            .storage()
+            .instance()
+            .get(&K_FACTOR)
+            .unwrap_or(32); // Default K-factor
+
+        let mut ratings: Map<Address, PlayerRating> = env
+            .storage()
+            .instance()
+            .get(&PLAYER_RATINGS)
+            .ok_or(ContractError::RatingNotFound)?;
+
+        let mut rating1 = ratings.get(player1.clone()).ok_or(ContractError::RatingNotFound)?;
+        let mut rating2 = ratings.get(player2.clone()).ok_or(ContractError::RatingNotFound)?;
+
+        // Calculate expected scores
+        let expected1 = Self::calculate_expected_score(rating1.rating, rating2.rating);
+        let expected2 = Self::calculate_expected_score(rating2.rating, rating1.rating);
+
+        // Determine actual scores
+        let (score1, score2) = match result {
+            1 => (1.0, 0.0), // Player1 wins
+            2 => (0.0, 1.0), // Player2 wins
+            3 => (0.5, 0.5), // Draw
+            _ => (0.0, 0.0),
+        };
+
+        // Calculate rating changes
+        let change1 = Self::calculate_rating_change(expected1, score1, k_factor);
+        let change2 = Self::calculate_rating_change(expected2, score2, k_factor);
+
+        // Update ratings
+        rating1.rating += change1;
+        rating2.rating += change2;
+
+        // Update highest rating
+        if rating1.rating > rating1.highest_rating {
+            rating1.highest_rating = rating1.rating;
+        }
+        if rating2.rating > rating2.highest_rating {
+            rating2.highest_rating = rating2.rating;
+        }
+
+        // Update stats
+        rating1.games_played += 1;
+        rating2.games_played += 1;
+
+        match result {
+            1 => {
+                rating1.wins += 1;
+                rating2.losses += 1;
+            }
+            2 => {
+                rating2.wins += 1;
+                rating1.losses += 1;
+            }
+            3 => {
+                rating1.draws += 1;
+                rating2.draws += 1;
+            }
+            _ => {}
+        }
+
+        rating1.last_updated = env.ledger().sequence() as u64;
+        rating2.last_updated = env.ledger().sequence() as u64;
+
+        // Save ratings
+        ratings.set(player1.clone(), rating1.clone());
+        ratings.set(player2.clone(), rating2.clone());
+        env.storage().instance().set(&PLAYER_RATINGS, &ratings);
+
+        // Emit rating update event
+        env.events().publish(
+            (symbol_short!("elo"), symbol_short!("update")),
+            (player1, rating1.rating, player2, rating2.rating),
+        );
+
+        Ok((rating1, rating2))
+    }
+
+    /// Query a player's rating
+    pub fn get_player_rating(env: Env, player: Address) -> Result<PlayerRating, ContractError> {
+        let ratings: Map<Address, PlayerRating> = env
+            .storage()
+            .instance()
+            .get(&PLAYER_RATINGS)
+            .ok_or(ContractError::RatingNotFound)?;
+
+        ratings.get(player).ok_or(ContractError::RatingNotFound)
+    }
+
+    // ── Internal ELO Calculation Helpers ───────────────────────────────────
+
+    /// Calculate expected score for a player
+    /// E_a = 1 / (1 + 10^((R_b - R_a) / 400))
+    fn calculate_expected_score(rating_a: i32, rating_b: i32) -> f64 {
+        let rating_diff = rating_b as f64 - rating_a as f64;
+        1.0 / (1.0 + f64::powf(10.0, rating_diff / 400.0))
+    }
+
+    /// Calculate rating change
+    /// ΔR = K * (S - E)
+    fn calculate_rating_change(expected: f64, actual: f64, k_factor: u32) -> i32 {
+        let change = (k_factor as f64) * (actual - expected);
+        change.round() as i32
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1018,5 +1225,119 @@ mod tests {
         let sig2 = sign_payload(&env, &signing_key, &recipient, reward_amount, nonce);
         let result = client.try_claim_puzzle_reward(&recipient, &reward_amount, &nonce, &sig2);
         assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
+    }
+
+    // ── ELO Rating System Tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_register_player() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, GameContract);
+        let client = GameContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let admin_key = Bytes::from_slice(&env, &[0u8; 32]);
+        let treasury_addr = Address::generate(&env);
+
+        client.initialize_puzzle_rewards(&admin, &admin_key, &0i128, &0u32, &treasury_addr);
+
+        let player = Address::generate(&env);
+        let rating = client.register_player(&player);
+
+        assert_eq!(rating.rating, 1200);
+        assert_eq!(rating.games_played, 0);
+        assert_eq!(rating.highest_rating, 1200);
+    }
+
+    #[test]
+    fn test_update_ratings_player1_wins() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, GameContract);
+        let client = GameContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let admin_key = Bytes::from_slice(&env, &[0u8; 32]);
+        let treasury_addr = Address::generate(&env);
+
+        client.initialize_puzzle_rewards(&admin, &admin_key, &0i128, &0u32, &treasury_addr);
+        client.initialize_elo_system(&admin, &32u32);
+
+        let player1 = Address::generate(&env);
+        let player2 = Address::generate(&env);
+
+        client.register_player(&player1);
+        client.register_player(&player2);
+
+        // Player1 wins
+        let result = client.update_ratings(&player1, &player2, &1u32);
+        let rating1 = result.0;
+        let rating2 = result.1;
+
+        // Player1 should gain rating, Player2 should lose
+        assert!(rating1.rating > 1200);
+        assert!(rating2.rating < 1200);
+        assert_eq!(rating1.wins, 1);
+        assert_eq!(rating2.losses, 1);
+        assert_eq!(rating1.games_played, 1);
+        assert_eq!(rating2.games_played, 1);
+    }
+
+    #[test]
+    fn test_update_ratings_draw() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, GameContract);
+        let client = GameContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let admin_key = Bytes::from_slice(&env, &[0u8; 32]);
+        let treasury_addr = Address::generate(&env);
+
+        client.initialize_puzzle_rewards(&admin, &admin_key, &0i128, &0u32, &treasury_addr);
+        client.initialize_elo_system(&admin, &32u32);
+
+        let player1 = Address::generate(&env);
+        let player2 = Address::generate(&env);
+
+        client.register_player(&player1);
+        client.register_player(&player2);
+
+        // Draw
+        let result = client.update_ratings(&player1, &player2, &3u32);
+        let rating1 = result.0;
+        let rating2 = result.1;
+
+        // Both players should have small changes (higher rated loses a bit)
+        assert_eq!(rating1.draws, 1);
+        assert_eq!(rating2.draws, 1);
+        assert_eq!(rating1.games_played, 1);
+        assert_eq!(rating2.games_played, 1);
+    }
+
+    #[test]
+    fn test_get_player_rating() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, GameContract);
+        let client = GameContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let admin_key = Bytes::from_slice(&env, &[0u8; 32]);
+        let treasury_addr = Address::generate(&env);
+
+        client.initialize_puzzle_rewards(&admin, &admin_key, &0i128, &0u32, &treasury_addr);
+
+        let player = Address::generate(&env);
+        client.register_player(&player);
+
+        let rating = client.get_player_rating(&player);
+        assert_eq!(rating.rating, 1200);
+        assert_eq!(rating.address, player);
     }
 }
