@@ -15,6 +15,7 @@ pub enum GameState {
     Created,
     InProgress,
     Completed,
+    Settled,
     Drawn,
     Forfeited,
 }
@@ -144,6 +145,10 @@ pub enum ContractError {
     InsufficientDisputeFee = 21,
     /// Only the waiting player can claim a timeout win
     InvalidTimeoutClaimant = 22,
+    /// Settlement or payout has already been processed
+    AlreadySettled = 23,
+    /// Amount value must be positive and within supported bounds
+    InvalidAmount = 24,
 }
 
 #[contract]
@@ -236,7 +241,9 @@ impl GameContract {
             token_client.transfer(&contract_address, &winner, &amount);
         }
 
-        games.set(game_id, game);
+        let mut settled_game = game;
+        settled_game.state = GameState::Settled;
+        games.set(game_id, settled_game);
         env.storage().instance().set(&GAMES, &games);
 
         Ok(())
@@ -502,9 +509,9 @@ impl GameContract {
         env.crypto()
             .ed25519_verify(&admin_pubkey, &digest_bytes, &signature);
 
-        game.state = GameState::Completed;
         game.winner = Some(winner.clone());
         Self::process_payout(&env, &game, &winner)?;
+        game.state = GameState::Settled;
 
         games.set(game_id, game);
         env.storage().instance().set(&GAMES, &games);
@@ -580,9 +587,9 @@ impl GameContract {
             game.player1.clone()
         };
 
-        game.state = GameState::Forfeited;
         game.winner = Some(winner.clone());
         Self::process_payout(&env, &game, &winner)?;
+        game.state = GameState::Settled;
 
         games.set(game_id, game);
         env.storage().instance().set(&GAMES, &games);
@@ -597,9 +604,12 @@ impl GameContract {
             .get(&GAMES)
             .ok_or(ContractError::GameNotFound)?;
 
-        let game = games.get(game_id).ok_or(ContractError::GameNotFound)?;
+        let mut game = games.get(game_id).ok_or(ContractError::GameNotFound)?;
 
         if game.state != GameState::Completed {
+            if game.state == GameState::Settled {
+                return Err(ContractError::AlreadySettled);
+            }
             return Err(ContractError::GameNotInProgress);
         }
         if game.winner.as_ref() != Some(&winner) {
@@ -609,6 +619,7 @@ impl GameContract {
         winner.require_auth();
 
         Self::process_payout(&env, &game, &winner)?;
+        game.state = GameState::Settled;
 
         games.set(game_id, game);
         env.storage().instance().set(&GAMES, &games);
@@ -693,8 +704,10 @@ impl GameContract {
             escrow.set(first_winner.clone(), winner_escrow + remainder);
         }
 
+        let mut settled_game = game;
+        settled_game.state = GameState::Settled;
         env.storage().instance().set(&ESCROW, &escrow);
-        games.set(game_id, game);
+        games.set(game_id, settled_game);
         env.storage().instance().set(&GAMES, &games);
 
         Ok(())
@@ -857,7 +870,19 @@ impl GameContract {
         env.storage().instance().set(&MAX_STAKE, &1_000i128);
     }
 
-    pub fn set_max_stake(env: Env, new_limit: i128) {
+    pub fn set_max_stake(env: Env, admin: Address, new_limit: i128) {
+        let current_admin: Address = env
+            .storage()
+            .instance()
+            .get(&CONTRACT_ADMIN)
+            .expect("Not initialized");
+        current_admin.require_auth();
+        if admin != current_admin {
+            panic!("Unauthorized admin address");
+        }
+        if new_limit <= 0 {
+            panic!("Max stake must be positive");
+        }
         env.storage().instance().set(&MAX_STAKE, &new_limit);
     }
 
@@ -912,6 +937,10 @@ impl GameContract {
         nonce: u64,
         signature: BytesN<64>,
     ) -> Result<(), ContractError> {
+        if reward_amount <= 0 || reward_amount > i64::MAX as i128 {
+            return Err(ContractError::InvalidAmount);
+        }
+
         // 1. Load admin ED25519 public key
         let admin_key_bytes: Bytes = env
             .storage()
@@ -1176,15 +1205,15 @@ impl GameContract {
             .ok_or(ContractError::TimeoutNotConfigured)?;
 
         let current_ledger = env.ledger().sequence() as u64;
-        let elapsed = current_ledger - game.last_move_at;
+        let elapsed = current_ledger.saturating_sub(game.last_move_at);
 
         if elapsed < timeout_duration {
             return Err(ContractError::TimeoutNotReached);
         }
 
-        game.state = GameState::Completed;
         game.winner = Some(claimant.clone());
         Self::process_payout(&env, &game, &claimant)?;
+        game.state = GameState::Settled;
 
         games.set(game_id, game);
         env.storage().instance().set(&GAMES, &games);
@@ -1208,7 +1237,7 @@ impl GameContract {
 
         let timeout_duration: u64 = env.storage().instance().get(&TIMEOUT_DURATION)?;
         let current_ledger = env.ledger().sequence() as u64;
-        let elapsed = current_ledger - game.last_move_at;
+        let elapsed = current_ledger.saturating_sub(game.last_move_at);
 
         if elapsed >= timeout_duration {
             return Some(0);
@@ -1270,6 +1299,7 @@ impl GameContract {
                 game.state = GameState::Completed;
                 game.winner = Some(winner_addr.clone());
                 Self::process_payout(&env, &game, winner_addr)?;
+                game.state = GameState::Settled;
             }
             None => {
                 game.state = GameState::Drawn;
@@ -1536,7 +1566,7 @@ mod tests {
         );
 
         // Raise stake limit first so wager=500 is permitted
-        client.set_max_stake(&1_000i128);
+        client.set_max_stake(&admin, &1_000i128);
 
         let wager: i128 = 500; // pool = 1000
         let game_id = client.create_game(&player1, &wager);
@@ -1642,6 +1672,19 @@ mod tests {
         assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
     }
 
+    #[test]
+    fn test_claim_puzzle_reward_invalid_amount_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, signing_key) = setup(&env, 10_000);
+        let recipient = Address::generate(&env);
+
+        let sig = sign_payload(&env, &signing_key, &recipient, -1, 7);
+        let result = client.try_claim_puzzle_reward(&recipient, &-1, &7, &sig);
+        assert_eq!(result, Err(Ok(ContractError::InvalidAmount)));
+    }
+
     // ── Timeout Tests ──────────────────────────────────────────────────────
 
     #[test]
@@ -1691,7 +1734,7 @@ mod tests {
             &treasury_addr,
         );
         client.configure_timeout(&admin, &100u64);
-        client.set_max_stake(&1_000i128);
+        client.set_max_stake(&admin, &1_000i128);
 
         let wager: i128 = 100;
         let game_id = client.create_game(&player1, &wager);
@@ -1742,7 +1785,7 @@ mod tests {
             &treasury_addr,
         );
         client.configure_timeout(&admin, &1000u64);
-        client.set_max_stake(&1_000i128);
+        client.set_max_stake(&admin, &1_000i128);
 
         let wager: i128 = 100;
         let game_id = client.create_game(&player1, &wager);
@@ -1782,7 +1825,7 @@ mod tests {
             &treasury_addr,
         );
         client.configure_timeout(&admin, &1000u64);
-        client.set_max_stake(&1_000i128);
+        client.set_max_stake(&admin, &1_000i128);
 
         let wager: i128 = 100;
         let game_id = client.create_game(&player1, &wager);
@@ -1834,7 +1877,7 @@ mod tests {
             &treasury_addr,
         );
         client.configure_dispute_system(&admin, &arbitrator, &25i128);
-        client.set_max_stake(&1_000i128);
+        client.set_max_stake(&admin, &1_000i128);
 
         let wager: i128 = 100;
         let game_id = client.create_game(&player1, &wager);
@@ -1883,7 +1926,7 @@ mod tests {
             &treasury_addr,
         );
         client.configure_dispute_system(&admin, &arbitrator, &0i128);
-        client.set_max_stake(&1_000i128);
+        client.set_max_stake(&admin, &1_000i128);
 
         let wager: i128 = 100;
         let game_id = client.create_game(&player1, &wager);
@@ -1935,7 +1978,7 @@ mod tests {
             &treasury_addr,
         );
         client.configure_dispute_system(&admin, &arbitrator, &25i128);
-        client.set_max_stake(&1_000i128);
+        client.set_max_stake(&admin, &1_000i128);
 
         let wager: i128 = 100;
         let game_id = client.create_game(&player1, &wager);
@@ -1978,7 +2021,7 @@ mod tests {
             &treasury_addr,
         );
         client.configure_dispute_system(&admin, &arbitrator, &0i128);
-        client.set_max_stake(&1_000i128);
+        client.set_max_stake(&admin, &1_000i128);
 
         let wager: i128 = 100;
         let game_id = client.create_game(&player1, &wager);
@@ -2029,7 +2072,7 @@ mod tests {
             &treasury_addr,
         );
         client.configure_timeout(&admin, &100u64);
-        client.set_max_stake(&1_000i128);
+        client.set_max_stake(&admin, &1_000i128);
 
         let wager: i128 = 100;
         let game_id = client.create_game(&player1, &wager);
@@ -2062,6 +2105,7 @@ mod tests {
         let admin = Address::generate(&env);
         let player1 = Address::generate(&env);
         let player2 = Address::generate(&env);
+        let treasury_addr = Address::generate(&env);
 
         stellar_asset_client.mint(&player1, &1_000i128);
         stellar_asset_client.mint(&player2, &1_000i128);
@@ -2070,7 +2114,14 @@ mod tests {
         let client = GameContractClient::new(&env, &contract_id);
 
         client.initialize_token(&admin, &token_address);
-        client.set_max_stake(&1_000i128);
+        client.initialize_puzzle_rewards(
+            &admin,
+            &Bytes::from_slice(&env, &[0u8; 32]),
+            &0i128,
+            &0u32,
+            &treasury_addr,
+        );
+        client.set_max_stake(&admin, &1_000i128);
 
         let wager: i128 = 100;
         let game_id = client.create_game(&player1, &wager);
@@ -2120,6 +2171,7 @@ mod tests {
         let admin = Address::generate(&env);
         let player1 = Address::generate(&env);
         let player2 = Address::generate(&env);
+        let treasury_addr = Address::generate(&env);
 
         stellar_asset_client.mint(&player1, &1_000i128);
         stellar_asset_client.mint(&player2, &1_000i128);
@@ -2128,7 +2180,14 @@ mod tests {
         let client = GameContractClient::new(&env, &contract_id);
 
         client.initialize_token(&admin, &token_address);
-        client.set_max_stake(&1_000i128);
+        client.initialize_puzzle_rewards(
+            &admin,
+            &Bytes::from_slice(&env, &[0u8; 32]),
+            &0i128,
+            &0u32,
+            &treasury_addr,
+        );
+        client.set_max_stake(&admin, &1_000i128);
 
         let wager: i128 = 100;
         let game_id = client.create_game(&player1, &wager);
@@ -2175,7 +2234,7 @@ mod tests {
             &treasury_addr,
         );
         client.configure_dispute_system(&admin, &arbitrator, &25i128);
-        client.set_max_stake(&1_000i128);
+        client.set_max_stake(&admin, &1_000i128);
 
         let wager: i128 = 100;
         let game_id = client.create_game(&player1, &wager);
@@ -2227,7 +2286,7 @@ mod tests {
             &0u32,
             &treasury_addr,
         );
-        client.set_max_stake(&1_000i128);
+        client.set_max_stake(&admin, &1_000i128);
 
         let wager: i128 = 500;
         let game_id = client.create_game(&player1, &wager);
@@ -2249,5 +2308,46 @@ mod tests {
         // pool = 1000: player1 gets 600, player2 gets 400
         assert_eq!(token_client.balance(&player1), 1100); // started 1000, put in 500, gets 600
         assert_eq!(token_client.balance(&player2), 900); // started 1000, put in 500, gets 400
+    }
+
+    #[test]
+    fn test_payout_cannot_be_called_twice() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, GameContract);
+        let client = GameContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let player1 = Address::generate(&env);
+        let player2 = Address::generate(&env);
+        let treasury_addr = Address::generate(&env);
+
+        let stellar_token = env.register_stellar_asset_contract_v2(issuer);
+        let token_address = stellar_token.address();
+        let stellar_asset_client = StellarAssetClient::new(&env, &token_address);
+
+        client.initialize_token(&admin, &token_address);
+        let admin_key = Bytes::from_slice(&env, &[0u8; 32]);
+        client.initialize_puzzle_rewards(&admin, &admin_key, &0i128, &0u32, &treasury_addr);
+
+        let wager = 500;
+        stellar_asset_client.mint(&player1, &wager);
+        stellar_asset_client.mint(&player2, &wager);
+        let game_id = client.create_game(&player1, &wager);
+        client.join_game(&game_id, &player2);
+
+        env.as_contract(&contract_id, || {
+            let mut games: Map<u64, Game> = env.storage().instance().get(&GAMES).unwrap();
+            let mut game = games.get(game_id).unwrap();
+            game.state = GameState::Completed;
+            game.winner = Some(player1.clone());
+            games.set(game_id, game);
+            env.storage().instance().set(&GAMES, &games);
+        });
+
+        client.payout(&game_id, &player1);
+        let second = client.try_payout(&game_id, &player1);
+        assert_eq!(second, Err(Ok(ContractError::AlreadySettled)));
     }
 }
