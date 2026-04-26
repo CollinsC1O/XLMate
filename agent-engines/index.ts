@@ -1,6 +1,7 @@
 import { SecurityGuard } from "./security_guard";
 import { JobQueue } from "./job_queue";
 import { trackActivity, checkUser } from "./anomaly_service";
+import { DashboardService } from "./monitoring/dashboard_service";
 
 const guard = new SecurityGuard();
 
@@ -46,4 +47,20 @@ export function handleUserAction(userId: string, action: string) {
   return {
     blocked: false,
   };
+}
+
+
+const dashboard = new DashboardService();
+
+export function trackAIRequest(duration: number, success: boolean) {
+  dashboard.recordLatency(duration);
+  dashboard.recordThroughput(1);
+
+  if (!success) {
+    dashboard.recordError();
+  }
+}
+
+export function getAIHealthDashboard() {
+  return dashboard.getDashboard();
 }
