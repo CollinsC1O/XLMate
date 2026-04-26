@@ -1,10 +1,15 @@
 # agent-engines
 
-GPU-oriented engine infrastructure for the XLMate chess platform. The module provides an asyncio-based worker pool that wraps UCI-compatible engines, with first-class support for Leela Chess Zero (`lc0`) and CPU fallback support for Stockfish.
+GPU-oriented engine infrastructure for the XLMate chess platform. The module provides an asyncio-based worker pool that wraps UCI-compatible engines, with first-class support for Leela Chess Zero (`lc0`), CPU fallback support for Stockfish, **Natural Language Agent interface**, and **Stockfish 16.1 WASM integration**.
 
 ## Overview
 
 The GPU worker subsystem is designed for long-running analysis services where neural-network inference should stay close to a dedicated GPU while requests are dispatched through a pool abstraction.
+
+**New Features:**
+- 🤖 **Natural Language Agent**: Interact with chess engines using plain English
+- 🌐 **Stockfish WASM**: Browser-compatible chess engine via WebAssembly
+- 🚀 **Soroban CI/CD**: Automated blockchain contract deployment pipeline
 
 ```text
 Client/API
@@ -31,6 +36,11 @@ WorkerPool ------------------> ResourceMonitor
 - `gpu_worker/pool.py`: least-loaded worker dispatch.
 - `gpu_worker/batch.py`: time- and size-based batching layer.
 - `gpu_worker/resource_monitor.py`: CPU/GPU monitoring with graceful fallback.
+- `gpu_worker/nl_models.py`: Natural language agent request/response models.
+- `gpu_worker/nl_intent_parser.py`: Intent recognition and entity extraction.
+- `gpu_worker/nl_agent.py`: Natural language agent service layer.
+- `gpu_worker/stockfish_wasm.py`: Stockfish 16.1 WASM integration module.
+- `gpu_worker/stockfish_wasm_bridge.py`: TypeScript bridge code generator.
 
 ## Requirements
 
@@ -93,6 +103,121 @@ Key options:
 
 ```bash
 python main.py
+```
+
+### Natural Language Agent
+
+Interact with chess engines using plain English:
+
+```python
+import asyncio
+
+from gpu_worker.config import WorkerConfig
+from gpu_worker.pool import WorkerPool
+from gpu_worker.nl_agent import NaturalLanguageAgent
+
+
+async def run() -> None:
+    # Initialize worker pool
+    pool = WorkerPool([WorkerConfig()])
+    await pool.start_all()
+    
+    try:
+        # Create natural language agent
+        agent = NaturalLanguageAgent(pool)
+        
+        # Ask for move suggestion
+        response = await agent.process_request(
+            user_input="What's the best move in this position?",
+            fen="rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+        )
+        
+        print(response.natural_language_response)
+        print(f"Best move: {response.best_move}")
+        
+        # Ask for position analysis
+        analysis = await agent.process_request(
+            user_input="Analyze this position for me",
+            fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            complexity="beginner",  # or "intermediate", "advanced"
+        )
+        
+        print(analysis.natural_language_response)
+        
+    finally:
+        await pool.shutdown_all()
+
+
+asyncio.run(run())
+```
+
+### Stockfish WASM Integration
+
+Use Stockfish 16.1 in the browser via WebAssembly:
+
+```python
+import asyncio
+
+from gpu_worker.stockfish_wasm import StockfishWASMEngine, WASMEngineConfig
+
+
+async def run() -> None:
+    # Create WASM engine
+    config = WASMEngineConfig(
+        threads=2,
+        hash_size_mb=32,
+        default_depth=18,
+    )
+    engine = StockfishWASMEngine(config)
+    
+    try:
+        # Initialize engine
+        await engine.initialize()
+        
+        # Analyze position
+        result = await engine.analyze_position(
+            fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            depth=20,
+        )
+        
+        print(f"Best move: {result.best_move}")
+        print(f"Evaluation: {result.evaluation}")
+        print(f"Depth: {result.depth}")
+        
+    finally:
+        await engine.shutdown()
+
+
+asyncio.run(run())
+```
+
+### Frontend WASM Integration (React/TypeScript)
+
+```typescript
+import { useStockfishWASM, AnalysisDisplay } from '@/components/chess/StockfishWASM';
+
+function ChessAnalysisPanel() {
+  const { isReady, isAnalyzing, error, analyzePosition } = useStockfishWASM({
+    defaultDepth: 18,
+    threads: 2,
+  });
+
+  const handleAnalyze = async () => {
+    const result = await analyzePosition(
+      'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1'
+    );
+    console.log('Best move:', result.bestMove);
+  };
+
+  return (
+    <div>
+      <button onClick={handleAnalyze} disabled={!isReady}>
+        Analyze Position
+      </button>
+      <AnalysisDisplay result={null} isAnalyzing={isAnalyzing} />
+    </div>
+  );
+}
 ```
 
 ### Submit a single request
@@ -163,6 +288,83 @@ The test suite uses mocked UCI processes and does not require `lc0` or Stockfish
 ```bash
 pytest
 ```
+
+### Run specific test suites
+
+```bash
+# Test Natural Language Agent
+pytest tests/test_nl_agent.py -v
+
+# Test Stockfish WASM integration
+pytest tests/test_stockfish_wasm.py -v
+
+# Test GPU worker pool
+pytest tests/test_pool.py -v
+
+# Run with coverage
+pytest --cov=gpu_worker --cov-report=html
+```
+
+## Soroban Contract Deployment
+
+XLMate includes a comprehensive CI/CD pipeline for deploying Soroban smart contracts to Stellar networks.
+
+### Automated Deployment
+
+The GitHub Actions workflow (`.github/workflows/soroban-deploy.yml`) provides:
+
+- **Automated testing and validation** of all contracts
+- **Multi-environment deployment** (testnet, futurenet)
+- **Rollback support** with backup management
+- **Deployment verification** and health checks
+- **Artifact preservation** for audit trails
+
+### Manual Deployment
+
+Use the advanced deployment script for manual deployments:
+
+```bash
+cd contracts
+
+# Deploy all contracts to testnet
+./deploy_advanced.sh deploy testnet
+
+# Deploy specific contract
+./deploy_advanced.sh deploy testnet game_contract testnet-deployer
+
+# Rollback to previous deployment
+./deploy_advanced.sh rollback testnet game_contract
+
+# Verify deployment
+./deploy_advanced.sh verify testnet game_contract
+
+# View deployment history
+./deploy_advanced.sh history
+
+# List available backups
+./deploy_advanced.sh backups
+```
+
+### CI/CD Pipeline Features
+
+1. **Validation Stage**: Runs tests, builds WASM, validates contracts
+2. **Deployment Stage**: Deploys to specified network with identity management
+3. **Verification Stage**: Confirms successful deployment
+4. **Notification Stage**: Generates deployment summary
+
+### Required Secrets
+
+Set up these GitHub secrets for automated deployment:
+
+- `SOROBAN_SECRET_KEY`: Testnet deployment key
+- `SOROBAN_FUTURENET_SECRET_KEY`: Futurenet deployment key
+
+### Environment Configuration
+
+Configure GitHub environments:
+
+- **testnet**: Requires approval for main branch deployments
+- **futurenet**: Manual trigger only
 
 ## Notes
 
