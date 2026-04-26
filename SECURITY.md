@@ -129,3 +129,4 @@ If you contribute code to XLMate, please keep security in mind:
 - Keep dependencies updated and review changes to blockchain, auth, and networking libraries carefully
 
 If you are unsure whether something is security-sensitive, treat it as such and ask privately.
+
