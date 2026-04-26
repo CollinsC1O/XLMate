@@ -1,5 +1,6 @@
 import { SecurityGuard } from "./security_guard";
 import { JobQueue } from "./job_queue";
+import { trackActivity, checkUser } from "./anomaly_service";
 
 const guard = new SecurityGuard();
 
@@ -26,5 +27,23 @@ export function runAIAnalysis(payload: any) {
 
   return {
     status: "queued",
+  };
+}
+
+
+export function handleUserAction(userId: string, action: string) {
+  trackActivity(userId, action);
+
+  const analysis = checkUser(userId);
+
+  if (analysis.isBot) {
+    return {
+      blocked: true,
+      reasons: analysis.reasons,
+    };
+  }
+
+  return {
+    blocked: false,
   };
 }
