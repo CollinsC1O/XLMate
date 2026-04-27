@@ -2,8 +2,10 @@
 extern crate std;
 
 use super::*;
+use ed25519_dalek::{Signer, SigningKey};
+use rand::rngs::OsRng;
 use soroban_sdk::token::StellarAssetClient;
-use soroban_sdk::{Address, Bytes, Env, Map, Vec, testutils::Address as _};
+use soroban_sdk::{Address, Bytes, BytesN, Env, Map, Vec, testutils::Address as _};
 
 /// Helper: seed a completed game directly into contract storage, bypassing
 /// token transfers and auth checks.  Returns the game_id (always 1).
@@ -377,27 +379,67 @@ fn init_contract(env: &Env, contract_id: &Address) -> (Address, Address) {
     (admin, treasury)
 }
 
+/// Helper: initialise the contract with a real ed25519 signing key.
+/// Returns (admin, treasury, signing_key).
+fn init_contract_with_key(
+    env: &Env,
+    contract_id: &Address,
+) -> (Address, Address, SigningKey) {
+    let client = GameContractClient::new(env, contract_id);
+    let admin = Address::generate(env);
+    let treasury = Address::generate(env);
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let admin_key = Bytes::from_slice(env, &signing_key.verifying_key().to_bytes());
+    env.mock_all_auths();
+    client.initialize_puzzle_rewards(&admin, &admin_key, &0i128, &0u32, &treasury);
+    (admin, treasury, signing_key)
+}
+
+/// Sign the SEP-10 payload: SHA256(address_bytes || nonce_bytes || expiry_le8)
+fn sign_sep10_payload(
+    env: &Env,
+    signing_key: &SigningKey,
+    account: &Address,
+    nonce: &BytesN<32>,
+    expiry: u64,
+) -> BytesN<64> {
+    let mut payload = Bytes::new(env);
+
+    let account_str = account.clone().to_string();
+    let str_len = account_str.len() as usize;
+    let mut addr_buf = [0u8; 64];
+    account_str.copy_into_slice(&mut addr_buf[..str_len]);
+    payload.append(&Bytes::from_slice(env, &addr_buf[..str_len]));
+
+    let nonce_bytes: Bytes = nonce.clone().into();
+    payload.append(&nonce_bytes);
+
+    payload.append(&Bytes::from_slice(env, &expiry.to_le_bytes()));
+
+    let digest: BytesN<32> = env.crypto().sha256(&payload).into();
+    let mut digest_raw = [0u8; 32];
+    digest.copy_into_slice(&mut digest_raw);
+
+    BytesN::from_array(env, &signing_key.sign(&digest_raw).to_bytes())
+}
+
 #[test]
 fn test_sep10_issue_and_verify_marks_account_verified() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, GameContract);
     let client = GameContractClient::new(&env, &contract_id);
-    let (admin, _) = init_contract(&env, &contract_id);
+    let (admin, _, signing_key) = init_contract_with_key(&env, &contract_id);
 
     let account = Address::generate(&env);
     let nonce = BytesN::from_array(&env, &[1u8; 32]);
     let expiry: u64 = env.ledger().sequence() as u64 + 1000;
 
-    // Issue challenge
     client.issue_sep10_challenge(&admin, &account, &nonce, &expiry);
 
-    // Before verification the account is not verified
     assert!(!client.is_sep10_verified(&account));
 
-    // Verify — we use mock_all_auths so ed25519_verify is bypassed in tests
-    // by providing a dummy signature (all zeros).
-    let sig = BytesN::from_array(&env, &[0u8; 64]);
+    let sig = sign_sep10_payload(&env, &signing_key, &account, &nonce, expiry);
     client.verify_sep10_challenge(&account, &nonce, &sig);
 
     assert!(client.is_sep10_verified(&account));
@@ -409,7 +451,7 @@ fn test_sep10_challenge_cannot_be_reused() {
     env.mock_all_auths();
     let contract_id = env.register_contract(None, GameContract);
     let client = GameContractClient::new(&env, &contract_id);
-    let (admin, _) = init_contract(&env, &contract_id);
+    let (admin, _, signing_key) = init_contract_with_key(&env, &contract_id);
 
     let account = Address::generate(&env);
     let nonce = BytesN::from_array(&env, &[2u8; 32]);
@@ -417,10 +459,10 @@ fn test_sep10_challenge_cannot_be_reused() {
 
     client.issue_sep10_challenge(&admin, &account, &nonce, &expiry);
 
-    let sig = BytesN::from_array(&env, &[0u8; 64]);
+    let sig = sign_sep10_payload(&env, &signing_key, &account, &nonce, expiry);
     client.verify_sep10_challenge(&account, &nonce, &sig);
 
-    // Second verification with the same nonce must fail
+    // Second verification with the same nonce must fail (challenge consumed)
     let res = client.try_verify_sep10_challenge(&account, &nonce, &sig);
     assert!(res.is_err());
 }
